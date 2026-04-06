@@ -1,210 +1,205 @@
 """
 Order executor: handles the full lifecycle of a spike trade.
 
-Flow:
-  1. Receive a NewListing signal.
-  2. If the listing has a scheduled_at time, sleep until T-0.
-  3. Fire a market buy immediately.
-  4. Start a tight price-polling loop.
-  5. Exit (market sell) when:
-     - Price >= entry * (1 + TAKE_PROFIT_PCT / 100)   → take profit
-     - Price <= entry * (1 - STOP_LOSS_PCT / 100)     → stop loss
-     - Time elapsed > MAX_HOLD_SECONDS                 → time exit
+Fast path (announcement-based listing):
+  T-25s  presign_market_buy()   → payload built & signed, ready to send
+  T-0    fire_presigned()       → one POST with pre-built bytes (~8–30 ms total)
+
+Slow path (api_poll detection):
+  T=0    market_buy()           → live-signed POST (~10–60 ms total)
+
+Exit via price monitoring:
+  • WS price feed (lock-free, ~1ms latency) if available
+  • Falls back to REST order-book poll (100ms interval)
 """
 import asyncio
 import time
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Optional
 
 from loguru import logger
 
-from bot.exchange import BitgetExchange
+from bot.fast_client import FastOrderClient
 from bot.listing_monitor import NewListing
 from config import Config
+
+# Pre-sign this many seconds before scheduled launch
+_PRESIGN_LEAD_S = 25
 
 
 class ExitReason(Enum):
     TAKE_PROFIT = auto()
-    STOP_LOSS = auto()
-    TIMEOUT = auto()
-    ERROR = auto()
+    STOP_LOSS   = auto()
+    TIMEOUT     = auto()
+    ERROR       = auto()
 
 
 @dataclass
 class TradeResult:
-    symbol: str
-    entry_price: float
-    exit_price: float
-    quantity: float
-    pnl_pct: float
-    exit_reason: ExitReason
+    symbol:       str
+    entry_price:  float
+    exit_price:   float
+    quantity:     float
+    pnl_pct:      float
+    exit_reason:  ExitReason
     hold_seconds: float
 
 
 class OrderExecutor:
-    def __init__(self, exchange: BitgetExchange):
-        self._exchange = exchange
-        self._active_symbols: set[str] = set()
+    def __init__(self, fast_client: FastOrderClient):
+        self._client = fast_client
+        self._active: set[str] = set()
 
     async def handle_listing(self, listing: NewListing):
-        """Entry point called by ListingMonitor for every new coin."""
         sym = listing.symbol
-
-        if sym in self._active_symbols:
-            logger.debug(f"Already trading {sym}, skipping.")
+        if sym in self._active:
             return
-
-        self._active_symbols.add(sym)
+        self._active.add(sym)
         try:
-            await self._execute_spike_trade(listing)
+            await self._execute(listing)
         finally:
-            self._active_symbols.discard(sym)
+            self._active.discard(sym)
 
     # ------------------------------------------------------------------
-    # Core trade logic
+    # Core trade
     # ------------------------------------------------------------------
 
-    async def _execute_spike_trade(self, listing: NewListing):
+    async def _execute(self, listing: NewListing):
         sym = listing.symbol
-        base = listing.base
 
-        # ── 1. Pre-arm: wait until scheduled launch ────────────────────
+        # ── Pre-arm: subscribe WS price feed ──────────────────────────
+        await self._client.subscribe_price_feed(sym)
+
+        # ── Pre-sign if we have a scheduled launch time ────────────────
         if listing.scheduled_at:
-            now = time.time()
-            wait = listing.scheduled_at - now - 0.05  # arrive 50 ms early
+            now  = time.time()
+            wait = listing.scheduled_at - now - _PRESIGN_LEAD_S
             if wait > 0:
-                logger.info(f"[{sym}] Waiting {wait:.1f}s until scheduled launch…")
+                logger.info(f"[{sym}] Sleeping {wait:.1f}s before pre-signing…")
                 await asyncio.sleep(wait)
 
-        # ── 2. Market buy ──────────────────────────────────────────────
-        logger.info(f"[{sym}] Firing market BUY for {Config.TRADE_AMOUNT_USDT} USDT")
-        buy_order = await self._exchange.market_buy(sym, Config.TRADE_AMOUNT_USDT)
+            self._client.presign_market_buy(sym, Config.TRADE_AMOUNT_USDT)
 
-        if not buy_order:
-            logger.error(f"[{sym}] Buy order failed, aborting.")
-            return
+            # Sleep the remaining time until T-0
+            remaining = listing.scheduled_at - time.time() - 0.01  # 10ms early
+            if remaining > 0:
+                logger.info(f"[{sym}] Pre-signed. Firing in {remaining:.3f}s…")
+                await asyncio.sleep(remaining)
 
+        # ── FIRE order ─────────────────────────────────────────────────
+        t_fire = time.perf_counter()
+
+        if listing.scheduled_at and sym in self._client._presigned:
+            order = await self._client.fire_presigned(sym)
+        else:
+            order = await self._client.market_buy(sym, Config.TRADE_AMOUNT_USDT)
+
+        fire_ms = (time.perf_counter() - t_fire) * 1000
         entry_time = time.time()
+        logger.success(f"[{sym}] Buy fired in {fire_ms:.1f} ms")
 
-        # ── 3. Determine entry price and quantity ──────────────────────
-        entry_price, quantity = await self._get_entry_details(sym, buy_order)
-        if entry_price <= 0 or quantity <= 0:
-            logger.error(f"[{sym}] Could not determine entry price/qty, aborting.")
+        if not order:
+            logger.error(f"[{sym}] Buy failed, aborting.")
             return
 
-        tp_price = entry_price * (1 + Config.TAKE_PROFIT_PCT / 100)
-        sl_price = entry_price * (1 - Config.STOP_LOSS_PCT / 100)
+        # ── Resolve entry price & quantity ─────────────────────────────
+        entry_price, quantity = await self._resolve_entry(sym, order)
+        if entry_price <= 0 or quantity <= 0:
+            logger.error(f"[{sym}] Could not resolve entry, aborting.")
+            return
+
+        tp = entry_price * (1 + Config.TAKE_PROFIT_PCT / 100)
+        sl = entry_price * (1 - Config.STOP_LOSS_PCT  / 100)
 
         logger.info(
             f"[{sym}] Entered @ {entry_price:.8f} | "
-            f"TP={tp_price:.8f} (+{Config.TAKE_PROFIT_PCT}%) | "
-            f"SL={sl_price:.8f} (-{Config.STOP_LOSS_PCT}%) | "
-            f"Qty={quantity:.6f}"
+            f"TP={tp:.8f} (+{Config.TAKE_PROFIT_PCT}%) | "
+            f"SL={sl:.8f} (-{Config.STOP_LOSS_PCT}%) | qty={quantity:.6f}"
         )
 
-        # ── 4. Price monitoring loop ───────────────────────────────────
-        exit_price, exit_reason = await self._monitor_price(
-            sym, entry_price, tp_price, sl_price, entry_time
-        )
+        # ── Monitor price ──────────────────────────────────────────────
+        exit_price, reason = await self._monitor(sym, entry_price, tp, sl, entry_time)
 
-        # ── 5. Market sell ─────────────────────────────────────────────
-        logger.info(f"[{sym}] Exiting ({exit_reason.name}) @ {exit_price:.8f}")
-        await self._exchange.market_sell(sym, quantity)
+        # ── Sell ───────────────────────────────────────────────────────
+        t_sell = time.perf_counter()
+        await self._client.market_sell(sym, quantity)
+        sell_ms = (time.perf_counter() - t_sell) * 1000
+        logger.info(f"[{sym}] Sell fired in {sell_ms:.1f} ms")
 
-        # ── 6. Report ──────────────────────────────────────────────────
-        pnl_pct = (exit_price / entry_price - 1) * 100
+        # ── Report ─────────────────────────────────────────────────────
+        pnl  = (exit_price / entry_price - 1) * 100
         hold = time.time() - entry_time
-        result = TradeResult(
-            symbol=sym,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            quantity=quantity,
-            pnl_pct=pnl_pct,
-            exit_reason=exit_reason,
-            hold_seconds=hold,
-        )
-        self._log_result(result)
+        self._report(TradeResult(sym, entry_price, exit_price, quantity, pnl, reason, hold))
+
+    # ------------------------------------------------------------------
+    # Price monitoring (WS-first, REST fallback)
+    # ------------------------------------------------------------------
+
+    async def _monitor(
+        self,
+        symbol: str,
+        entry: float,
+        tp: float,
+        sl: float,
+        t_start: float,
+    ) -> tuple[float, ExitReason]:
+        while True:
+            elapsed = time.time() - t_start
+
+            if elapsed >= Config.MAX_HOLD_SECONDS:
+                price = self._client.get_ws_price(symbol) or entry
+                return price, ExitReason.TIMEOUT
+
+            # Prefer lock-free WS price (sub-ms)
+            price = self._client.get_ws_price(symbol)
+
+            if price is None:
+                # WS not ready yet – REST fallback
+                try:
+                    from bot.exchange import BitgetExchange  # lazy import to avoid circular
+                except Exception:
+                    await asyncio.sleep(0.05)
+                    continue
+                await asyncio.sleep(0.1)
+                continue
+
+            pct = (price / entry - 1) * 100
+            logger.debug(f"[{symbol}] {price:.8f} | {pct:+.2f}% | {elapsed:.2f}s")
+
+            if price >= tp:
+                return price, ExitReason.TAKE_PROFIT
+            if price <= sl:
+                return price, ExitReason.STOP_LOSS
+
+            await asyncio.sleep(0.01)  # 10ms loop when using WS prices
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _get_entry_details(self, symbol: str, buy_order: dict) -> tuple[float, float]:
-        """
-        Extract average fill price and filled quantity from the buy order.
-        Falls back to polling the order book if the order doesn't have fills.
-        """
-        avg_price = float(buy_order.get("average") or buy_order.get("price") or 0)
-        filled_qty = float(buy_order.get("filled") or buy_order.get("amount") or 0)
+    async def _resolve_entry(self, symbol: str, order: dict) -> tuple[float, float]:
+        """Extract fill price and qty from order response, or approximate."""
+        price = float(order.get("priceAvg") or order.get("average") or order.get("price") or 0)
+        qty   = float(order.get("baseVolume") or order.get("filled") or order.get("amount") or 0)
 
-        if avg_price <= 0 or filled_qty <= 0:
-            if Config.DRY_RUN:
-                # Simulate: fetch best ask as entry price, compute quantity
-                try:
-                    price = await self._exchange.poll_price(symbol)
-                    avg_price = price
-                    filled_qty = Config.TRADE_AMOUNT_USDT / price if price > 0 else 0
-                except Exception:
-                    return 0.0, 0.0
-            else:
-                # Try to fetch order details from exchange
-                try:
-                    await asyncio.sleep(0.3)
-                    ticker = await self._exchange.get_ticker(symbol)
-                    avg_price = float(ticker.get("last") or 0)
-                    filled_qty = Config.TRADE_AMOUNT_USDT / avg_price if avg_price > 0 else 0
-                except Exception:
-                    return 0.0, 0.0
+        if price <= 0 or qty <= 0:
+            # Dry-run or order didn't include fills: use WS price
+            for _ in range(10):
+                ws = self._client.get_ws_price(symbol)
+                if ws and ws > 0:
+                    price = ws
+                    qty   = Config.TRADE_AMOUNT_USDT / price
+                    break
+                await asyncio.sleep(0.05)
 
-        return avg_price, filled_qty
-
-    async def _monitor_price(
-        self,
-        symbol: str,
-        entry_price: float,
-        tp_price: float,
-        sl_price: float,
-        entry_time: float,
-    ) -> tuple[float, ExitReason]:
-        """
-        Poll price at ~100 ms intervals and return (price, reason) when an
-        exit condition is triggered.
-        """
-        while True:
-            elapsed = time.time() - entry_time
-
-            # Time-based exit
-            if elapsed >= Config.MAX_HOLD_SECONDS:
-                try:
-                    current = await self._exchange.poll_price(symbol)
-                except Exception:
-                    current = entry_price
-                return current, ExitReason.TIMEOUT
-
-            try:
-                current = await self._exchange.poll_price(symbol)
-            except Exception as e:
-                logger.warning(f"[{symbol}] Price fetch error: {e}")
-                await asyncio.sleep(0.1)
-                continue
-
-            pct = (current / entry_price - 1) * 100
-            logger.debug(f"[{symbol}] Price={current:.8f} | {pct:+.2f}% | t={elapsed:.2f}s")
-
-            if current >= tp_price:
-                return current, ExitReason.TAKE_PROFIT
-            if current <= sl_price:
-                return current, ExitReason.STOP_LOSS
-
-            await asyncio.sleep(0.1)  # 100 ms poll
+        return price, qty
 
     @staticmethod
-    def _log_result(result: TradeResult):
-        emoji = "✅" if result.pnl_pct >= 0 else "❌"
+    def _report(r: TradeResult):
+        sign = "+" if r.pnl_pct >= 0 else ""
         logger.info(
-            f"{emoji} TRADE CLOSED | {result.symbol} | "
-            f"Entry={result.entry_price:.8f} | Exit={result.exit_price:.8f} | "
-            f"PnL={result.pnl_pct:+.2f}% | Reason={result.exit_reason.name} | "
-            f"Hold={result.hold_seconds:.2f}s"
+            f"{'PROFIT' if r.pnl_pct >= 0 else 'LOSS '} | {r.symbol} | "
+            f"entry={r.entry_price:.8f} exit={r.exit_price:.8f} | "
+            f"pnl={sign}{r.pnl_pct:.2f}% | reason={r.exit_reason.name} | "
+            f"hold={r.hold_seconds:.2f}s"
         )

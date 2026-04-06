@@ -16,6 +16,7 @@ import sys
 from loguru import logger
 
 from bot.exchange import BitgetExchange
+from bot.fast_client import FastOrderClient
 from bot.listing_monitor import ListingMonitor
 from bot.strategy import SpikeStrategy
 from config import Config
@@ -49,9 +50,12 @@ async def main():
     logger.info(f"Max hold   : {Config.MAX_HOLD_SECONDS}s")
     logger.info(f"Poll interval: {Config.POLL_INTERVAL_MS} ms")
 
-    exchange = BitgetExchange()
-    strategy = SpikeStrategy(exchange)
-    monitor = ListingMonitor(exchange, on_new_listing=strategy.on_new_listing)
+    exchange    = BitgetExchange()
+    fast_client = FastOrderClient()
+    await fast_client.start()   # pre-warm persistent HTTP session
+
+    strategy = SpikeStrategy(exchange, fast_client)
+    monitor  = ListingMonitor(exchange, on_new_listing=strategy.on_new_listing)
 
     try:
         await monitor.start()
@@ -59,6 +63,7 @@ async def main():
         logger.info("Shutting down…")
     finally:
         monitor.stop()
+        await fast_client.close()
         await exchange.close()
         logger.info("Bye.")
 

@@ -14,17 +14,18 @@ from typing import Optional
 from loguru import logger
 
 from bot.exchange import BitgetExchange
+from bot.fast_client import FastOrderClient
 from bot.listing_monitor import NewListing
 from bot.order_executor import OrderExecutor
 from config import Config
 
 
 class SpikeStrategy:
-    def __init__(self, exchange: BitgetExchange):
+    def __init__(self, exchange: BitgetExchange, fast_client: FastOrderClient):
         self._exchange = exchange
-        self._executor = OrderExecutor(exchange)
+        self._fast_client = fast_client
+        self._executor = OrderExecutor(fast_client)
         self._trade_count = 0
-        self._total_pnl_pct = 0.0
 
     async def on_new_listing(self, listing: NewListing):
         """Called by ListingMonitor for every new coin. Applies filters then fires."""
@@ -33,7 +34,7 @@ class SpikeStrategy:
 
         # ── Filter 1: Balance check ────────────────────────────────────
         if not Config.DRY_RUN:
-            balance = await self._exchange.get_balance("USDT")
+            balance = await self._fast_client.get_balance("USDT")
             if balance < Config.TRADE_AMOUNT_USDT:
                 logger.warning(
                     f"[STRATEGY] Skipping {sym}: insufficient balance "
